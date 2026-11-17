@@ -1,6 +1,10 @@
 """Test how bounding boxes are defined for SVG tags."""
 
+from xml.etree import ElementTree
+
 import pytest
+
+from weasyprint.svg.bounding_box import bounding_box_path
 
 from ...testing_utils import assert_no_logs
 
@@ -371,6 +375,35 @@ def test_bounding_box_path_s(assert_pixels):
         </g>
       </svg>
     ''')
+
+
+@assert_no_logs
+def test_bounding_box_path_bezier_extrema():
+    """Bounding box of Bézier curves uses the curve's extrema, not its
+    control points, which generally lie off the curve (see #3019)."""
+    class FakeSVG:
+        def point(self, x, y, font_size):
+            return float(x), float(y)
+
+    def bounding_box(d):
+        node = ElementTree.Element('path', {'d': d})
+        return bounding_box_path(FakeSVG(), node, 16)
+
+    # Cubic curve from #3019: control points at y=10, the curve itself only
+    # reaches y=30, so the bounding box is 60 high, not 80
+    assert bounding_box('M120 90 C120 10 200 10 200 90 Z') == (120, 30, 80, 60)
+    # Same curve with relative coordinates
+    assert bounding_box('M120 90 c0 -80 80 -80 80 0 Z') == (120, 30, 80, 60)
+    # Cubic curve with an extremum on the x axis too
+    assert bounding_box('M0 0 C100 0 0 100 100 100') == (0, 0, 100, 100)
+    # Quadratic curve: control point at y=10, the curve reaches y=50
+    assert bounding_box('M120 90 Q160 10 200 90 Z') == (120, 50, 80, 40)
+    # Smooth cubic curve, first control point reflected from previous curve:
+    # the reflected control point is at y=-20, but the curve only reaches -15
+    assert bounding_box(
+        'M0 0 C0 20 20 20 20 0 S40 -20 40 0') == (0, -15, 40, 30)
+    # Straight curves, control points on the curve: bounding box is unchanged
+    assert bounding_box('M 0 1 C 0 1 1 1 3 1') == (0, 1, 3, 0)
 
 
 @assert_no_logs

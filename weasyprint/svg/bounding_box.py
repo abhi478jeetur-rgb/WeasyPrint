@@ -65,6 +65,69 @@ def bounding_box_polyline(svg, node, font_size):
     return extend_bounding_box(bounding_box, points)
 
 
+def _bezier_point(p0, p1, p2, p3, t):
+    """Point on a cubic Bézier curve at parameter ``t``."""
+    u = 1 - t
+    return (
+        u ** 3 * p0[0] + 3 * u ** 2 * t * p1[0] + 3 * u * t ** 2 * p2[0] +
+        t ** 3 * p3[0],
+        u ** 3 * p0[1] + 3 * u ** 2 * t * p1[1] + 3 * u * t ** 2 * p2[1] +
+        t ** 3 * p3[1])
+
+
+def _solve_quadratic(a, b, c):
+    """Roots of ``a·t² + b·t + c = 0`` in the ]0, 1[ interval."""
+    roots = []
+    if a == 0:
+        if b != 0:
+            roots.append(-c / b)
+    else:
+        discriminant = b ** 2 - 4 * a * c
+        if discriminant >= 0:
+            sqrt_discriminant = sqrt(discriminant)
+            roots.append((-b - sqrt_discriminant) / (2 * a))
+            roots.append((-b + sqrt_discriminant) / (2 * a))
+    return [t for t in roots if 0 < t < 1]
+
+
+def _cubic_bezier_extrema(p0, p1, p2, p3):
+    """Points on a cubic Bézier curve where it reaches its extrema.
+
+    The bounding box of a Bézier curve is defined by its endpoints and the
+    points where its derivative is zero, not by its control points, which
+    generally lie off the curve.
+    """
+    points = []
+    for i in (0, 1):
+        # Derivative of the Bézier curve, divided by 3: a·t² + b·t + c = 0
+        a = -p0[i] + 3 * p1[i] - 3 * p2[i] + p3[i]
+        b = 2 * (p0[i] - 2 * p1[i] + p2[i])
+        c = p1[i] - p0[i]
+        for t in _solve_quadratic(a, b, c):
+            points.append(_bezier_point(p0, p1, p2, p3, t))
+    return points
+
+
+def _quadratic_bezier_point(p0, p1, p2, t):
+    """Point on a quadratic Bézier curve at parameter ``t``."""
+    u = 1 - t
+    return (
+        u ** 2 * p0[0] + 2 * u * t * p1[0] + t ** 2 * p2[0],
+        u ** 2 * p0[1] + 2 * u * t * p1[1] + t ** 2 * p2[1])
+
+
+def _quadratic_bezier_extrema(p0, p1, p2):
+    """Points on a quadratic Bézier curve where it reaches its extrema."""
+    points = []
+    for i in (0, 1):
+        denominator = p0[i] - 2 * p1[i] + p2[i]
+        if denominator:
+            t = (p0[i] - p1[i]) / denominator
+            if 0 < t < 1:
+                points.append(_quadratic_bezier_point(p0, p1, p2, t))
+    return points
+
+
 def bounding_box_path(svg, node, font_size):
     """Bounding box for path node."""
     path_data = node.get('d', '')
@@ -77,6 +140,10 @@ def bounding_box_path(svg, node, font_size):
     bounding_box = EMPTY_BOUNDING_BOX
     previous_x = 0
     previous_y = 0
+    # Second control point of the previous cubic Bézier segment, used to get
+    # the first control point of a smooth curve ('S'/'s') by reflection
+    previous_x2 = None
+    previous_y2 = None
     letter = 'M'    # Move as default
     while path_data:
         path_data = path_data.strip()
@@ -119,7 +186,7 @@ def bounding_box_path(svg, node, font_size):
             previous_y = y
 
         elif letter in 'cC':
-            # Curve
+            # Cubic Bézier curve
             x1, y1, path_data = point(svg, path_data, font_size)
             x2, y2, path_data = point(svg, path_data, font_size)
             x, y, path_data = point(svg, path_data, font_size)
@@ -133,9 +200,15 @@ def bounding_box_path(svg, node, font_size):
                 x += previous_x
                 y += previous_y
 
-            # Extend bounding box with all coordinates
+            # Extend bounding box with the end point and the curve's extrema.
+            # Control points generally lie off the curve, they must not be
+            # included, otherwise the bounding box is too large and gradients
+            # using objectBoundingBox are distorted (see #3019).
+            points = _cubic_bezier_extrema(
+                (previous_x, previous_y), (x1, y1), (x2, y2), (x, y))
             bounding_box = extend_bounding_box(
-                bounding_box, ((x1, y1), (x2, y2), (x, y)))
+                bounding_box, [*points, (x, y)])
+            previous_x2, previous_y2 = x2, y2
             previous_x = x
             previous_y = y
 
@@ -167,21 +240,54 @@ def bounding_box_path(svg, node, font_size):
             previous_x = x
             previous_y = y
 
-        elif letter in 'qQsS':
-            # Quadratic curve/Smooth curve
+        elif letter in 'qQ':
+            # Quadratic Bézier curve
             x1, y1, path_data = point(svg, path_data, font_size)
             x, y, path_data = point(svg, path_data, font_size)
 
             # Relative coordinates, convert to absolute
-            if letter in 'qs':
+            if letter == 'q':
                 x1 += previous_x
                 y1 += previous_y
                 x += previous_x
                 y += previous_y
 
-            # Extend bounding box with coordinates
+            # Extend bounding box with the end point and the curve's extrema,
+            # the control point lies off the curve (see #3019)
+            points = _quadratic_bezier_extrema(
+                (previous_x, previous_y), (x1, y1), (x, y))
             bounding_box = extend_bounding_box(
-                bounding_box, ((x1, y1), (x, y)))
+                bounding_box, [*points, (x, y)])
+            previous_x = x
+            previous_y = y
+
+        elif letter in 'sS':
+            # Smooth cubic Bézier curve: the first control point is the
+            # reflection of the previous segment's second control point, or
+            # the current point when there is no previous cubic curve
+            x2, y2, path_data = point(svg, path_data, font_size)
+            x, y, path_data = point(svg, path_data, font_size)
+
+            # Relative coordinates, convert to absolute
+            if letter == 's':
+                x2 += previous_x
+                y2 += previous_y
+                x += previous_x
+                y += previous_y
+
+            if previous_x2 is None:
+                x1, y1 = previous_x, previous_y
+            else:
+                x1 = 2 * previous_x - previous_x2
+                y1 = 2 * previous_y - previous_y2
+
+            # Extend bounding box with the end point and the curve's extrema
+            # (see #3019)
+            points = _cubic_bezier_extrema(
+                (previous_x, previous_y), (x1, y1), (x2, y2), (x, y))
+            bounding_box = extend_bounding_box(
+                bounding_box, [*points, (x, y)])
+            previous_x2, previous_y2 = x2, y2
             previous_x = x
             previous_y = y
 
@@ -200,6 +306,10 @@ def bounding_box_path(svg, node, font_size):
             previous_y = y
 
         path_data = path_data.strip()
+        if letter not in 'cCsS':
+            # No previous cubic curve for a following smooth curve
+            previous_x2 = None
+            previous_y2 = None
 
     return bounding_box
 
